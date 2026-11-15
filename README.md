@@ -2,7 +2,7 @@
 
 - 팀명: 신호등 (10조)
 - 제출 회차: 2회차
-- 제출 버전: 태그 `submission-2b` (브랜치 `dongsik`)
+- 제출 버전: 태그 `submission-2b` (커밋 `39bc8a9`, 브랜치 `dongsik`)
 
 ## 방법
 딥러닝·머신러닝을 쓰지 않는 STFT 기반 HRNR(Harmonic Regeneration Noise Reduction) 필터입니다. 처리 과정에서 Clean 음성은 사용하지 않고, 입력 파일 하나만 보고 동작합니다.
