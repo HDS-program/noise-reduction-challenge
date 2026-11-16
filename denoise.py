@@ -24,7 +24,9 @@ XI_MIN_DB = -25.0
 SPEECH_GAIN_FLOOR = 0.15
 LOW_BAND_HZ = 500.0     # below this, speech fundamentals live: classify more carefully
 STAT_CV_LOW = 1.15      # cv threshold below LOW_BAND_HZ (cv averaged over 3 neighbouring bins)
-STAT_CV_HIGH = 1.8      # cv threshold above LOW_BAND_HZ
+STAT_CV_MID = 1.9       # cv threshold between LOW_BAND_HZ and HIGH_BAND_HZ (speech formants)
+HIGH_BAND_HZ = 4000.0   # above this, speech is weak and noise dominates
+STAT_CV_HIGH = 2.2      # cv threshold above HIGH_BAND_HZ
 CV_SMOOTH_BINS = 3
 STAT_NOISE_SCALE = 1.2  # noise-like bins: noise level = 1.2 x whole-file mean
 STAT_LEVEL_DB = -3.0    # ... and are at least this strong relative to the first estimate
@@ -81,13 +83,15 @@ def estimate_noise(power, times, padded_len, fs):
     # Speech makes a bin's power swing between talking and pauses (large std/mean);
     # steady noise and tones vary much less. Noise-like bins use the whole-file mean
     # as their noise level and are suppressed more deeply.
-    # Low band (speech fundamentals, engine noise): cv averaged over neighbouring bins
-    # and a stricter threshold, so speech bins there are not mistaken for noise.
+    # Three bands: below 500 Hz (speech fundamentals, engine noise) cv is averaged over
+    # neighbouring bins with a strict threshold so speech is not mistaken for noise;
+    # above 4 kHz speech is weak, so noise-like bins are taken more aggressively.
     mean = inner.mean(axis=1)
     cv = inner.std(axis=1) / np.maximum(mean, EPS)
-    low = np.arange(power.shape[0]) * fs / N_FFT < LOW_BAND_HZ
+    freq = np.arange(power.shape[0]) * fs / N_FFT
+    low = freq < LOW_BAND_HZ
     cv = np.where(low, uniform_filter1d(cv, CV_SMOOTH_BINS, mode="nearest"), cv)
-    threshold = np.where(low, STAT_CV_LOW, STAT_CV_HIGH)
+    threshold = np.where(low, STAT_CV_LOW, np.where(freq >= HIGH_BAND_HZ, STAT_CV_HIGH, STAT_CV_MID))
     steady = (cv < threshold) & (mean > 10 ** (STAT_LEVEL_DB / 10) * first)
     noise = np.where(steady, STAT_NOISE_SCALE * np.maximum(base, mean), base)
     floor = np.where(steady, min(STAT_GAIN_FLOOR, SPEECH_GAIN_FLOOR), SPEECH_GAIN_FLOOR)
