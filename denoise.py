@@ -1,7 +1,9 @@
 """Speech denoiser (classical signal processing only, no ML, no clean reference).
 
-High-pass -> STFT -> per-bin speech/noise classification by temporal variation (cv)
--> noise PSD estimate -> HRNR gain (two-step SNR estimate + harmonic regeneration).
+High-pass -> STFT -> noise PSD estimate (quiet frames, trimmed-mean correction,
+per-bin speech/noise classification by temporal variation with separate low/high-band
+thresholds, persistent-line detection)
+-> HRNR gain (two-step SNR estimate + harmonic regeneration).
 Usage: python denoise.py [--input input] [--output output]
 """
 import argparse
@@ -10,19 +12,29 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from scipy import signal
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import median_filter, uniform_filter1d
 
 N_FFT = 1536            # 96 ms at 16 kHz
 HOP = 384               # 75 % overlap
 HIGHPASS_HZ = 150.0
 NOISE_FRACTION = 0.1    # quietest frames used for the first noise estimate
-DD_SMOOTHING = 0.95     # decision-directed a priori SNR smoothing
+DD_SMOOTHING = 0.97     # decision-directed a priori SNR smoothing
 HRNR_RHO = 0.5          # mix of TSNR estimate and regenerated harmonics
 XI_MIN_DB = -25.0
 SPEECH_GAIN_FLOOR = 0.15
-STAT_CV = 1.3           # bins whose power varies less than this (std/mean) are noise-like
+LOW_BAND_HZ = 500.0     # below this, speech fundamentals live: classify more carefully
+STAT_CV_LOW = 1.15      # cv threshold below LOW_BAND_HZ (cv averaged over 3 neighbouring bins)
+STAT_CV_HIGH = 1.8      # cv threshold above LOW_BAND_HZ
+CV_SMOOTH_BINS = 3
+STAT_NOISE_SCALE = 1.2  # noise-like bins: noise level = 1.2 x whole-file mean
 STAT_LEVEL_DB = -3.0    # ... and are at least this strong relative to the first estimate
 STAT_GAIN_FLOOR = 0.01  # deeper suppression for noise-like bins
+TRIM_K = 2.0            # trimmed mean: drop values above K x estimate (speech)
+TRIM_ITERS = 8
+TONE_PERSIST_Q = 0.25   # a line must stay strong in >= 75 % of the frames
+TONE_THRESHOLD_DB = 15.0
+TONE_BAND_HZ = 250.0    # width of the local background used for line detection
+TONE_GAIN_FLOOR = 0.01
 EPS = 1e-18
 
 
@@ -53,16 +65,40 @@ def estimate_noise(power, times, padded_len, fs):
     count = max(1, int(np.ceil(NOISE_FRACTION * len(full))))
     quiet = full[np.argsort(power[:, full].mean(axis=0), kind="stable")[:count]]
     first = np.maximum(uniform_filter1d(power[:, quiet].mean(axis=1), 3, mode="nearest"), EPS)
+    inner = power[:, full]
+
+    # Trimmed mean per bin: values far above the estimate are treated as speech.
+    # Taking the smaller estimate lowers bins where speech leaked into quiet frames.
+    c = 1 - TRIM_K * np.exp(-TRIM_K) / (1 - np.exp(-TRIM_K))
+    lam = first.copy()
+    for _ in range(TRIM_ITERS):
+        mask = inner < TRIM_K * lam[:, None]
+        cnt = mask.sum(axis=1)
+        trimmed = np.where(mask, inner, 0).sum(axis=1) / np.maximum(cnt, 1) / c
+        lam = np.maximum(np.where(cnt > 0, trimmed, lam), EPS)
+    base = np.maximum(np.minimum(first, lam), EPS)
 
     # Speech makes a bin's power swing between talking and pauses (large std/mean);
     # steady noise and tones vary much less. Noise-like bins use the whole-file mean
     # as their noise level and are suppressed more deeply.
-    inner = power[:, full]
+    # Low band (speech fundamentals, engine noise): cv averaged over neighbouring bins
+    # and a stricter threshold, so speech bins there are not mistaken for noise.
     mean = inner.mean(axis=1)
     cv = inner.std(axis=1) / np.maximum(mean, EPS)
-    steady = (cv < STAT_CV) & (mean > 10 ** (STAT_LEVEL_DB / 10) * first)
-    noise = np.where(steady, np.maximum(first, mean), first)
+    low = np.arange(power.shape[0]) * fs / N_FFT < LOW_BAND_HZ
+    cv = np.where(low, uniform_filter1d(cv, CV_SMOOTH_BINS, mode="nearest"), cv)
+    threshold = np.where(low, STAT_CV_LOW, STAT_CV_HIGH)
+    steady = (cv < threshold) & (mean > 10 ** (STAT_LEVEL_DB / 10) * first)
+    noise = np.where(steady, STAT_NOISE_SCALE * np.maximum(base, mean), base)
     floor = np.where(steady, min(STAT_GAIN_FLOOR, SPEECH_GAIN_FLOOR), SPEECH_GAIN_FLOOR)
+
+    # Persistent narrow-band lines (dial tones, sirens): stronger than the local
+    # background for most of the file. Catches on/off tones the cv test misses.
+    persist = np.quantile(inner, TONE_PERSIST_Q, axis=1)
+    width = max(3, int(round(TONE_BAND_HZ * N_FFT / fs)) | 1)
+    line = persist > 10 ** (TONE_THRESHOLD_DB / 10) * median_filter(persist, size=width, mode="nearest")
+    noise = np.where(line, np.maximum(noise, np.median(inner, axis=1)), noise)
+    floor = np.where(line, np.minimum(floor, TONE_GAIN_FLOOR), floor)
     return np.maximum(noise, EPS), floor
 
 
